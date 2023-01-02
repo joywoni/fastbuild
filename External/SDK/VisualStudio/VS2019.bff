@@ -8,42 +8,10 @@
 //  2) Specified via environment variables (VS Command Prompt)
 //  3) Part of a Visual Studio installation (Program Files)
 //
-#if file_exists( "2019/Community/VC/Tools/MSVC/14.28.29333/bin/Hostx64/x64/cl.exe" )
-    //
-    // Use vendorized toolchain
-    //
-    .VS2019_BasePath        = '$_CURRENT_BFF_DIR_$/2019/Community/VC'
-    .VS2019_Version         = '14.28.29333'
-#else
-    //
-    // Use environment variable if available (VS Command Prompt)
-    //
-    #if exists( VS160COMNTOOLS )
-        #import VCINSTALLDIR
-        #import VCToolsVersion
-        .VS2019_BasePath        = .VCINSTALLDIR
-        .VS2019_Version         = .VCToolsVersion
-    #else
-        //
-        // Use Visual Studio installation
-        //
-        #if file_exists( "C:/Program Files (x86)/Microsoft Visual Studio/2019/Community/VC/Tools/MSVC/14.28.29333/bin/Hostx64/x64/cl.exe" )
-            .VS2019_BasePath        = 'C:/Program Files (x86)/Microsoft Visual Studio/2019/Community/VC'
-            .VS2019_Version         = '14.28.29333'
-        #else
-            //
-            // Failed
-            //
-            Print( '-----------------------------------------------------------------------' )
-            Print( '- Unable to auto-detect VS2019 - please specify installation manually -' )
-            Print( '-----------------------------------------------------------------------' )
-            .VS2019_BasePath        = .Set_Path_Here    // <-- Set path here
-            .VS2019_Version         = .Set_Version_Here // <-- Set version here
-        #endif
-    #endif
-#endif
+.VS2019_BasePath         = 'C:/Program Files (x86)/Microsoft Visual Studio/2019/Community'
+.VS2019_Version          = '14.29.30133'
 
-.VS2019_ToolchainPath   = '$VS2019_BasePath$/Tools/MSVC/$VS2019_Version$'
+.VS2019_ToolchainPath   = '$VS2019_BasePath$/VC/Tools/MSVC/$VS2019_Version$'
 
 // X64 Compiler
 //------------------------------------------------------------------------------
@@ -64,8 +32,8 @@ Compiler( 'Compiler-VS2019-x64' )
                     '$Root$/tbbmalloc.dll' // Required as of 16.2 (14.22.27905)
                     '$Root$/vcruntime140.dll'
                     '$Root$/vcruntime140_1.dll' // Required as of 16.5.1 (14.25.28610)
-                    '$Root$/1033/clui.dll'
-                    '$Root$/1033/mspft140ui.dll' // Localized messages for static analysis
+                    '$Root$/1042/clui.dll'
+                    '$Root$/1042/mspft140ui.dll' // Localized messages for static analysis
                   }
 
     #if ENABLE_LIGHT_CACHE
