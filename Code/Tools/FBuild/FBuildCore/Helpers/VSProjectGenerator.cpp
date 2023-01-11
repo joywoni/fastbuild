@@ -293,11 +293,20 @@ const AString & VSProjectGenerator::GenerateVCXProj( const AString & projectFile
         {
             WriteF( "  <PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='%s|%s'\">\n", cIt->m_Config.Get(), cIt->m_Platform.Get() );
 
-            WritePGItem( "NMakeBuildCommandLine",           cIt->m_ProjectBuildCommand );
-            WritePGItem( "NMakeReBuildCommandLine",         cIt->m_ProjectRebuildCommand );
-            WritePGItem( "NMakeCleanCommandLine",           cIt->m_ProjectCleanCommand );
-            WritePGItem( "NMakeOutput",                     cIt->m_Output );
+            if ( cIt->m_Keyword == "Linux" )
+            {
+                WritePGItem( "BuildCommandLine",                cIt->m_ProjectBuildCommand );
+                WritePGItem( "ReBuildCommandLine",              cIt->m_ProjectRebuildCommand );
+                WritePGItem( "CleanCommandLine",                cIt->m_ProjectCleanCommand );
+            }
+            else
+            {
+                WritePGItem( "NMakeBuildCommandLine",           cIt->m_ProjectBuildCommand );
+                WritePGItem( "NMakeReBuildCommandLine",         cIt->m_ProjectRebuildCommand );
+                WritePGItem( "NMakeCleanCommandLine",           cIt->m_ProjectCleanCommand );
+            }
 
+            WritePGItem( "NMakeOutput",                     cIt->m_Output );
             const ObjectListNode * oln = nullptr;
             if ( cIt->m_PreprocessorDefinitions.IsEmpty() || cIt->m_IncludeSearchPath.IsEmpty() )
             {
@@ -642,7 +651,7 @@ void VSProjectGenerator::CanonicalizeFilePaths( const AString & projectBasePath 
         Array< VSProjectFilePair > uniqueFiles( m_Files.GetSize(), false );
         const VSProjectFilePair * prev = filePointers[ 0 ];
         uniqueFiles.Append( *filePointers[ 0 ] );
-        size_t numFiles = m_Files.GetSize();
+        const size_t numFiles = m_Files.GetSize();
         for ( size_t i=1; i<numFiles; ++i )
         {
             const VSProjectFilePair * current = filePointers[ i ];

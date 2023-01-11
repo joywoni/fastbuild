@@ -10,6 +10,7 @@
 #include "Core/Containers/Array.h"
 #include "Core/Containers/UniquePtr.h"
 #include "Core/Env/Assert.h"
+#include "Core/Process/Atomic.h"
 #include "Core/Process/Process.h"
 
 // Forward Declarations
@@ -18,10 +19,18 @@ class Args;
 class CompilerDriverBase;
 class ConstMemoryStream;
 class Function;
+class MultiBuffer;
 class NodeGraph;
 class NodeProxy;
 class ObjectNode;
 enum class ArgsResponseFileMode : uint32_t;
+
+// Defines
+//------------------------------------------------------------------------------
+#if defined( DEBUG )
+    // Enabled support for some test functionality
+    #define ENABLE_FAKE_SYSTEM_FAILURE
+#endif
 
 // ObjectNode
 //------------------------------------------------------------------------------
@@ -67,6 +76,7 @@ public:
         bool IsDiagnosticsColorAuto() const         { return ( ( m_Flags & FLAG_DIAGNOSTICS_COLOR_AUTO ) != 0 ); }
         bool IsWarningsAsErrorsClangGCC() const     { return ( ( m_Flags & FLAG_WARNINGS_AS_ERRORS_CLANGGCC ) != 0 ); }
         bool IsClangCl() const                      { return ( ( m_Flags & FLAG_CLANG_CL ) != 0 ); }
+        bool IsUsingGcovCoverage() const            { return ( ( m_Flags & FLAG_GCOV_COVERAGE ) != 0 ); }
 
         enum Flag : uint32_t
         {
@@ -94,6 +104,7 @@ public:
             FLAG_DIAGNOSTICS_COLOR_AUTO         = 0x800000,
             FLAG_WARNINGS_AS_ERRORS_CLANGGCC    = 0x1000000,
             FLAG_CLANG_CL                       = 0x2000000,
+            FLAG_GCOV_COVERAGE                  = 0x4000000,
         };
 
         void Set( Flag flag )       { m_Flags |= flag; }
@@ -133,6 +144,7 @@ public:
     bool IsUsingStaticAnalysisMSVC() const  { return m_CompilerFlags.IsUsingStaticAnalysisMSVC(); }
     bool IsOrbisWavePSSLC() const           { return m_CompilerFlags.IsOrbisWavePSSLC(); }
     bool IsWarningsAsErrorsClangGCC() const { return m_CompilerFlags.IsWarningsAsErrorsClangGCC(); }
+    bool IsUsingGcovCoverage() const        { return m_CompilerFlags.IsUsingGcovCoverage(); }
 
     virtual void SaveRemote( IOStream & stream ) const override;
     static Node * LoadRemote( IOStream & stream );
@@ -147,6 +159,7 @@ public:
 
     void GetPDBName( AString & pdbName ) const;
     void GetNativeAnalysisXMLPath( AString& outXMLFileName ) const;
+    void GetGCNOPath( AString & gcnoFileName ) const;
 
     const char * GetObjExtension() const;
 
@@ -154,6 +167,18 @@ public:
     const AString & GetOwnerObjectList() const { return m_OwnerObjectList; }
 
     void ExpandCompilerForceUsing( Args & fullArgs, const AString & pre, const AString & post ) const;
+
+#if defined( ENABLE_FAKE_SYSTEM_FAILURE )
+    // Fake system failure for tests
+    enum FakeSystemFailureState : uint32_t
+    {
+        DISABLED,   // Feature not in use
+        ENABLED,    // Feature enabled
+        RACING,     // Racing
+    };
+    static void SetFakeSystemFailureForNextJob() { sFakeSystemFailureState.Store( static_cast<uint32_t>( FakeSystemFailureState::ENABLED ) ); }
+    static bool GetFakeSystemFailureForNextJob() { return ( sFakeSystemFailureState.Load() > DISABLED ); }
+#endif
 
 private:
     virtual BuildResult DoBuild( Job * job ) override;
@@ -177,7 +202,14 @@ private:
 
     const AString & GetCacheName( Job * job ) const;
     bool RetrieveFromCache( Job * job );
-    void WriteToCache( Job * job );
+    void WriteToCache_FromDisk( Job * job );
+    void WriteToCache_FromUncompressedData( Job * job,
+                                            const void * uncompressedData,
+                                            uint64_t uncompressedDataSize );
+    void WriteToCache_FromCompressedData( Job * job,
+                                          const void * compressedData,
+                                          uint64_t compressedDataSize,
+                                          uint32_t compressionTimeMS );
     void GetExtraCacheFilePaths( const Job * job, Array< AString > & outFileNames ) const;
 
     void EmitCompilationMessage( const Args & fullArgs, bool useDeoptimization, bool stealingRemoteJob = false, bool racingRemoteJob = false, bool useDedicatedPreprocessor = false, bool isRemote = false ) const;
@@ -270,6 +302,11 @@ private:
     // Not serialized
     Array< AString >    m_Includes;
     bool                m_Remote                            = false;
+
+#if defined( ENABLE_FAKE_SYSTEM_FAILURE )
+    // Fake system failure for tests
+    static Atomic<uint32_t> sFakeSystemFailureState;
+#endif
 };
 
 //------------------------------------------------------------------------------

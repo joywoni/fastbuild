@@ -57,6 +57,12 @@
     #include <sys/time.h>
 #endif
 
+// Static Data
+//------------------------------------------------------------------------------
+#if defined( ENABLE_FAKE_SYSTEM_FAILURE )
+    /*static*/ Atomic<uint32_t> ObjectNode::sFakeSystemFailureState( FakeSystemFailureState::DISABLED );
+#endif
+
 // Reflection
 //------------------------------------------------------------------------------
 REFLECT_NODE_BEGIN( ObjectNode, Node, MetaNone() )
@@ -227,9 +233,9 @@ ObjectNode::~ObjectNode()
     // using deoptimization?
     bool useDeoptimization = ShouldUseDeoptimization();
 
-    bool useCache = ShouldUseCache();
-    bool useDist = m_CompilerFlags.IsDistributable() && m_AllowDistribution && FBuild::Get().GetOptions().m_AllowDistributed;
-    bool useSimpleDist = GetCompiler()->SimpleDistributionMode();
+    const bool useCache = ShouldUseCache();
+    const bool useDist = m_CompilerFlags.IsDistributable() && m_AllowDistribution && FBuild::Get().GetOptions().m_AllowDistributed;
+    const bool useSimpleDist = GetCompiler()->SimpleDistributionMode();
     bool usePreProcessor = !useSimpleDist && ( useCache || useDist || IsGCC() || IsSNC() || IsClang() || IsClangCl() || IsCodeWarriorWii() || IsGreenHillsWiiU() || IsVBCC() || IsOrbisWavePSSLC() );
     if ( GetDedicatedPreprocessor() )
     {
@@ -404,7 +410,7 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor( Job * job, bool useDeopti
     const bool showIncludes( false );
     const bool useSourceMapping( true );
     const bool finalize( true );
-    Pass pass = useSimpleDist ? PASS_PREP_FOR_SIMPLE_DISTRIBUTION : PASS_PREPROCESSOR_ONLY;
+    const Pass pass = useSimpleDist ? PASS_PREP_FOR_SIMPLE_DISTRIBUTION : PASS_PREPROCESSOR_ONLY;
     if ( !BuildArgs( job, fullArgs, pass, useDeoptimization, showIncludes, useSourceMapping, finalize ) )
     {
         return NODE_RESULT_FAILED; // BuildArgs will have emitted an error
@@ -504,8 +510,8 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor( Job * job, bool useDeopti
     {
         // compress job data
         Compressor c;
-        c.Compress( job->GetData(), job->GetDataSize() );
-        size_t compressedSize = c.GetResultSize();
+        c.Compress( job->GetData(), job->GetDataSize(), FBuild::Get().GetOptions().m_DistributionCompressionLevel );
+        const size_t compressedSize = c.GetResultSize();
         job->OwnData( c.ReleaseResult(), compressedSize, true );
 
         // yes... re-queue for secondary build
@@ -637,7 +643,22 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor2( Job * job, bool useDeopt
         EmitCompilationMessage( fullArgs, useDeoptimization, stealingRemoteJob, racingRemoteJob, false, isRemote );
     }
 
-    bool result = BuildFinalOutput( job, fullArgs );
+    #if defined( ENABLE_FAKE_SYSTEM_FAILURE )
+        // If racing while inducing a remote failure, ensure the remote failure
+        // always wins.
+        if ( racingRemoteJob && ( sFakeSystemFailureState.Load() > FakeSystemFailureState::DISABLED ) )
+        {
+            // Notify the remote side we're ready for it to fail
+            // and wait for it to be returned
+            sFakeSystemFailureState.Store( RACING );
+            while ( job->GetDistributionState() == Job::DIST_RACING )
+            {
+                Thread::Sleep( 1 );
+            }
+        }
+    #endif
+
+    const bool result = BuildFinalOutput( job, fullArgs );
 
     // cleanup temp file
     if ( tmpFileName.IsEmpty() == false )
@@ -672,7 +693,7 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor2( Job * job, bool useDeopt
         const bool useCache = ShouldUseCache();
         if ( m_Stamp && useCache )
         {
-            WriteToCache( job );
+            WriteToCache_FromDisk( job );
         }
     }
 
@@ -785,7 +806,7 @@ Node::BuildResult ObjectNode::DoBuild_QtRCC( Job * job )
 //------------------------------------------------------------------------------
 bool ObjectNode::ProcessIncludesMSCL( const char * output, uint32_t outputSize )
 {
-    Timer t;
+    const Timer t;
 
     {
         CIncludeParser parser;
@@ -818,7 +839,7 @@ bool ObjectNode::ProcessIncludesMSCL( const char * output, uint32_t outputSize )
 //------------------------------------------------------------------------------
 bool ObjectNode::ProcessIncludesWithPreProcessor( Job * job )
 {
-    Timer t;
+    const Timer t;
 
     {
         const char * output = (char *)job->GetData();
@@ -848,8 +869,8 @@ bool ObjectNode::ProcessIncludesWithPreProcessor( Job * job )
         {
             msvcStyle = m_CompilerFlags.IsMSVC() || m_CompilerFlags.IsCUDANVCC();
         }
-        bool result = msvcStyle ? parser.ParseMSCL_Preprocessed( output, outputSize )
-                                : parser.ParseGCC_Preprocessed( output, outputSize );
+        const bool result = msvcStyle ? parser.ParseMSCL_Preprocessed( output, outputSize )
+                                      : parser.ParseGCC_Preprocessed( output, outputSize );
         if ( result == false )
         {
             FLOG_ERROR( "Failed to process includes for '%s'", GetName().Get() );
@@ -1020,6 +1041,8 @@ bool ObjectNode::ProcessIncludesWithPreProcessor( Job * job )
             flags.Set( CompilerFlags::FLAG_DIAGNOSTICS_COLOR_AUTO );
         }
 
+        bool coverage = false;
+
         Array< AString > tokens;
         args.Tokenize( tokens );
         const AString * const end = tokens.End();
@@ -1034,6 +1057,20 @@ bool ObjectNode::ProcessIncludesWithPreProcessor( Job * job )
             else if ( token.BeginsWith( "-fdiagnostics-color" ) || token == "-fno-diagnostics-color" )
             {
                 flags.Clear( CompilerFlags::FLAG_DIAGNOSTICS_COLOR_AUTO );
+            }
+            else if ( token == "-ftest-coverage" )
+            {
+                flags.Set( CompilerFlags::FLAG_GCOV_COVERAGE );
+            }
+            else if ( token == "-fno-test-coverage" )
+            {
+                flags.Clear( CompilerFlags::FLAG_GCOV_COVERAGE );
+            }
+            else if ( token == "--coverage" )
+            {
+                // --coverage implies -ftest-coverage.
+                // But unlike -ftest-coverage it can't be reverted with -fno-test-coverage, so we need to handle it after the loop.
+                coverage = true;
             }
             else if ( token.BeginsWith( "-werror" ) )
             {
@@ -1055,6 +1092,11 @@ bool ObjectNode::ProcessIncludesWithPreProcessor( Job * job )
                 }
             }
         }
+
+        if ( coverage )
+        {
+            flags.Set( CompilerFlags::FLAG_GCOV_COVERAGE );
+        }
     }
 
     // check for cacheability/distributability for non-MSVC
@@ -1064,10 +1106,13 @@ bool ObjectNode::ProcessIncludesWithPreProcessor( Job * job )
          flags.IsCodeWarriorWii() ||
          flags.IsGreenHillsWiiU() )
     {
-        // creation of the PCH must be done locally to generate a usable PCH
-        // Objective C/C++ cannot be distributed
-        // Source mappings are not currently forwarded so can only compiled locally
-        if ( !creatingPCH && !objectiveC && !hasSourceMapping )
+        // * Creation of the PCH must be done locally to generate a usable PCH
+        // * Objective C/C++ cannot be distributed
+        // * Source mappings are not currently forwarded so can only compiled locally
+        // * Remote compilation with Gcov coverage is disabled as it has some issues:
+        //   1. .gcno files will contain incorrect build root path (working directory on the worker).
+        //   2. Object files compiled remotely will create .gcda files in the directory where these object files were stored on the worker.
+        if ( !creatingPCH && !objectiveC && !hasSourceMapping && !flags.IsUsingGcovCoverage() )
         {
             if ( isDistributableCompiler )
             {
@@ -1248,6 +1293,18 @@ void ObjectNode::GetNativeAnalysisXMLPath( AString& outXMLFileName ) const
     outXMLFileName += ".nativecodeanalysis.xml";
 }
 
+// GetGCNOPath
+//------------------------------------------------------------------------------
+void ObjectNode::GetGCNOPath( AString & gcnoFileName ) const
+{
+    ASSERT( IsUsingGcovCoverage() );
+
+    // TODO:B The .gcno path can be manually specified with -fprofile-note=
+    const char * extPos = m_Name.FindLast( '.' ); // Only last extension removed
+    gcnoFileName.Assign( m_Name.Get(), extPos ? extPos : m_Name.GetEnd() );
+    gcnoFileName += ".gcno";
+}
+
 // GetObjExtension
 //------------------------------------------------------------------------------
 const char * ObjectNode::GetObjExtension() const
@@ -1336,7 +1393,7 @@ bool ObjectNode::RetrieveFromCache( Job * job )
 
     const AString & cacheFileName = GetCacheName(job);
 
-    Timer t;
+    const Timer t;
 
     ICache * cache = FBuild::Get().GetCache();
     ASSERT( cache );
@@ -1353,33 +1410,22 @@ bool ObjectNode::RetrieveFromCache( Job * job )
         {
             pchKey = xxHash::Calc64( cacheData, cacheDataSize );
         }
-
+        
         const uint32_t startDecompress = uint32_t( t.GetElapsedMS() );
 
+        MultiBuffer buffer( cacheData, cacheDataSize );
+
         // do decompression
-        Compressor c;
-        if ( c.IsValidData( cacheData, cacheDataSize ) == false )
+        if ( buffer.Decompress() == false )
         {
-            FLOG_WARN( "Cache returned invalid data (header)\n"
+            FLOG_WARN( "Cache returned invalid data\n"
                        " - File: '%s'\n"
                        " - Key : %s\n",
                        m_Name.Get(), cacheFileName.Get() );
             return false;
         }
-        if ( c.Decompress( cacheData ) == false )
-        {
-            FLOG_WARN( "Cache returned invalid data (payload)\n"
-                       " - File: '%s'\n"
-                       " - Key : %s\n",
-                       m_Name.Get(), cacheFileName.Get() );
-            return false;
-        }
-        const void * data = c.GetResult();
-        const size_t dataSize = c.GetResultSize();
-
+        const size_t uncompressedDataSize = buffer.GetDataSize();
         const uint32_t stopDecompress = uint32_t( t.GetElapsedMS() );
-
-        MultiBuffer buffer( data, dataSize );
 
         Array< AString > fileNames( 4, false );
         fileNames.Append( m_Name );
@@ -1425,7 +1471,7 @@ bool ObjectNode::RetrieveFromCache( Job * job )
             output.Format( "Obj: %s <CACHE>\n", GetName().Get() );
             if ( FBuild::Get().GetOptions().m_CacheVerbose )
             {
-                output.AppendFormat( " - Cache Hit: %u ms (Retrieve: %u ms - Decompress: %u ms) (Compressed: %zu - Uncompressed: %zu) '%s'\n", uint32_t( t.GetElapsedMS() ), retrieveTime, stopDecompress - startDecompress, cacheDataSize, dataSize, cacheFileName.Get() );
+                output.AppendFormat( " - Cache Hit: %u ms (Retrieve: %u ms - Decompress: %u ms) (Compressed: %zu - Uncompressed: %zu) '%s'\n", uint32_t( t.GetElapsedMS() ), retrieveTime, stopDecompress - startDecompress, cacheDataSize, uncompressedDataSize, cacheFileName.Get() );
             }
             FLOG_OUTPUT( output );
         }
@@ -1455,9 +1501,9 @@ bool ObjectNode::RetrieveFromCache( Job * job )
     return false;
 }
 
-// WriteToCache
+// WriteToCache_FromDisk
 //------------------------------------------------------------------------------
-void ObjectNode::WriteToCache( Job * job )
+void ObjectNode::WriteToCache_FromDisk( Job * job )
 {
     if (FBuild::Get().GetOptions().m_UseCacheWrite == false)
     {
@@ -1466,71 +1512,116 @@ void ObjectNode::WriteToCache( Job * job )
 
     PROFILE_FUNCTION;
 
-    const AString & cacheFileName = GetCacheName(job);
-    ASSERT(!cacheFileName.IsEmpty());
-
-    Timer t;
-
-    ICache * cache = FBuild::Get().GetCache();
-    ASSERT( cache );
-
+    // Get list of files
     Array< AString > fileNames( 4, false );
     fileNames.Append( m_Name );
-
     GetExtraCacheFilePaths( job, fileNames );
 
+    // Load files
     MultiBuffer buffer;
-    if ( buffer.CreateFromFiles( fileNames ) )
+    if ( buffer.CreateFromFiles( fileNames ) == false )
     {
-        // try to compress
-        const uint32_t startCompress( (uint32_t)t.GetElapsedMS() );
-        Compressor c;
-        c.Compress( buffer.GetData(), (size_t)buffer.GetDataSize(), FBuild::Get().GetOptions().m_CacheCompressionLevel );
-        const void * data = c.GetResult();
-        const size_t dataSize = c.GetResultSize();
-        const uint32_t stopCompress( (uint32_t)t.GetElapsedMS() );
-
-        const uint32_t startPublish( stopCompress );
-        if ( cache->Publish( cacheFileName, data, dataSize ) )
+        // Output
+        if ( FBuild::Get().GetOptions().m_CacheVerbose )
         {
-            // cache store complete
-            const uint32_t stopPublish( (uint32_t)t.GetElapsedMS() );
-
-            SetStatFlag( Node::STATS_CACHE_STORE );
-
-            // Dependent objects need to know the PCH key to be able to pull from the cache
-            if ( IsCreatingPCH() && IsMSVC() )
-            {
-                m_PCHCacheKey = xxHash::Calc64( data, dataSize );
-            }
-
-            const uint32_t cachingTime = uint32_t( t.GetElapsedMS() );
-            AddCachingTime( cachingTime );
-
-            // Output
-            if ( FBuild::Get().GetOptions().m_CacheVerbose )
-            {
-                AStackString<> output;
-                output.Format( "Obj: %s\n"
-                                " - Cache Store: %u ms (Store: %u ms - Compress: %u ms) (Compressed: %zu - Uncompressed: %zu) '%s'\n",
-                                GetName().Get(), cachingTime, ( stopPublish - startPublish ), ( stopCompress - startCompress ), dataSize, (size_t)buffer.GetDataSize(), cacheFileName.Get() );
-                if ( m_PCHCacheKey != 0 )
-                {
-                    output.AppendFormat( " - PCH Key: %" PRIx64 "\n", m_PCHCacheKey );
-                }
-                FLOG_OUTPUT( output );
-            }
-
-            return;
+            FLOG_OUTPUT( "Obj: %s\n"
+                            " - Cache Store Fail: '%s' (local IO problem)\n",
+                            GetName().Get(), GetCacheName( job ).Get() );
         }
+        return;
     }
 
-    // Output
-    if ( FBuild::Get().GetOptions().m_CacheVerbose )
+    WriteToCache_FromUncompressedData( job,
+                                       buffer.GetData(),
+                                       buffer.GetDataSize() );
+}
+
+// WriteToCache_FromUncompressedData
+//------------------------------------------------------------------------------
+void ObjectNode::WriteToCache_FromUncompressedData( Job * job,
+                                                    const void * uncompressedData,
+                                                    uint64_t uncompressedDataSize )
+{
+    if ( FBuild::Get().GetOptions().m_UseCacheWrite == false )
     {
-        FLOG_OUTPUT( "Obj: %s\n"
-                     " - Cache Store Fail: %u ms '%s'\n",
-                     GetName().Get(), uint32_t( t.GetElapsedMS() ), cacheFileName.Get() );
+        return;
+    }
+
+    // Compress
+    const Timer t;
+    const uint32_t startCompress( (uint32_t)t.GetElapsedMS() );
+    Compressor c;
+    c.Compress(uncompressedData, uncompressedDataSize, FBuild::Get().GetOptions().m_CacheCompressionLevel );
+    const uint32_t compressionTime = ( (uint32_t)t.GetElapsedMS() - startCompress );
+
+    WriteToCache_FromCompressedData( job,
+                                     c.GetResult(),
+                                     static_cast<uint64_t>( c.GetResultSize() ),
+                                     compressionTime );
+}
+
+// WriteToCache_FromCompressedData
+//------------------------------------------------------------------------------
+void ObjectNode::WriteToCache_FromCompressedData( Job * job,
+                                                  const void * compressedData,
+                                                  uint64_t compressedDataSize,
+                                                  uint32_t compressionTimeMS )
+{
+    if ( FBuild::Get().GetOptions().m_UseCacheWrite == false )
+    {
+        return;
+    }
+
+    // Ensure data is compressed
+    ASSERT( Compressor::IsValidData( compressedData, compressedDataSize ) );
+
+    const AString & cacheFileName = GetCacheName(job);
+
+    // Commit to cache
+    const Timer t;
+    const uint32_t startPublish( (uint32_t)t.GetElapsedMS() );
+    if ( FBuild::Get().GetCache()->Publish( cacheFileName, compressedData, compressedDataSize ) )
+    {
+        // cache store complete
+        const uint32_t publishTime = ( (uint32_t)t.GetElapsedMS() - startPublish );
+
+        SetStatFlag( Node::STATS_CACHE_STORE );
+
+        // Dependent objects need to know the PCH key to be able to pull from the cache
+        if ( IsCreatingPCH() && IsMSVC() )
+        {
+            m_PCHCacheKey = xxHash::Calc64( compressedData, compressedDataSize );
+        }
+
+        const uint32_t cachingTime = uint32_t( t.GetElapsedMS() );
+        AddCachingTime( cachingTime );
+
+        // Output
+        if ( FBuild::Get().GetOptions().m_CacheVerbose )
+        {
+            const uint64_t uncompressedDataSize = Compressor::GetUncompressedSize( compressedData, compressedDataSize );
+            AStackString<> output;
+            output.Format( "Obj: %s\n"
+                           " - Cache Store: %u ms (Store: %u ms - Compress: %u ms) (Compressed: %" PRIu64 " - Uncompressed: %" PRIu64 ") '%s'\n",
+                           GetName().Get(), cachingTime, publishTime, compressionTimeMS, compressedDataSize, uncompressedDataSize, cacheFileName.Get() );
+            if ( m_PCHCacheKey != 0 )
+            {
+                output.AppendFormat( " - PCH Key: %" PRIx64 "\n", m_PCHCacheKey );
+            }
+            FLOG_OUTPUT( output );
+        }
+    }
+    else
+    {
+        // Cache store failed
+
+        // Output
+        if ( FBuild::Get().GetOptions().m_CacheVerbose )
+        {
+            FLOG_OUTPUT( "Obj: %s\n"
+                         " - Cache Store Fail: %u ms '%s'\n",
+                         GetName().Get(), uint32_t( t.GetElapsedMS() ), cacheFileName.Get() );
+        }
     }
 }
 
@@ -1544,21 +1635,16 @@ void ObjectNode::GetExtraCacheFilePaths( const Job * job, Array< AString > & out
         return;
     }
 
-    // Only the MSVC compiler creates extra objects
     const ObjectNode * objectNode = node->CastTo< ObjectNode >();
-    if ( objectNode->m_CompilerFlags.IsMSVC() == false )
-    {
-        return;
-    }
 
-    // Precompiled Headers have an extra file
-    if ( objectNode->m_CompilerFlags.IsCreatingPCH() )
+    // MSVC precompiled headers have an extra file
+    if ( objectNode->m_CompilerFlags.IsCreatingPCH() && objectNode->m_CompilerFlags.IsMSVC() )
     {
         // .pch.obj
         outFileNames.Append( m_PCHObjectFileName );
     }
 
-    // Static analysis adds extra files
+    // MSVC static analysis adds extra files
     if ( objectNode->m_CompilerFlags.IsUsingStaticAnalysisMSVC() )
     {
         if ( objectNode->m_CompilerFlags.IsCreatingPCH() )
@@ -1582,6 +1668,15 @@ void ObjectNode::GetExtraCacheFilePaths( const Job * job, Array< AString > & out
         AStackString<> xmlFileName;
         GetNativeAnalysisXMLPath( xmlFileName );
         outFileNames.Append( xmlFileName );
+    }
+
+    // Gcov coverage adds extra file
+    if ( objectNode->m_CompilerFlags.IsUsingGcovCoverage() )
+    {
+        // .gcno
+        AStackString<> gcnoFileName;
+        GetGCNOPath( gcnoFileName );
+        outFileNames.Append( gcnoFileName );
     }
 }
 
@@ -1818,7 +1913,7 @@ bool ObjectNode::LoadStaticSourceFileForDistribution( const Args & fullArgs, Job
         FLOG_ERROR( "Error: opening file '%s' while loading source file for transport\n", fileName.Get() );
         return false;
     }
-    uint32_t contentSize = (uint32_t)fs.GetFileSize();
+    const uint32_t contentSize = (uint32_t)fs.GetFileSize();
     UniquePtr< void > mem( ALLOC( contentSize ) );
     if ( fs.Read( mem.Get(), contentSize ) != contentSize )
     {
@@ -1837,7 +1932,7 @@ void ObjectNode::TransferPreprocessedData( const char * data, size_t dataSize, J
 {
     // We will trim the buffer
     const char* outputBuffer = data;
-    size_t outputBufferSize = dataSize;
+    const size_t outputBufferSize = dataSize;
     size_t newBufferSize = outputBufferSize;
     char * bufferCopy = nullptr;
 
@@ -1953,7 +2048,7 @@ bool ObjectNode::WriteTmpFile( Job * job, AString & tmpDirectory, AString & tmpF
     ASSERT( job->GetData() && job->GetDataSize() );
 
     const Node * sourceFile = GetSourceFile();
-    uint32_t sourceNameHash = xxHash::Calc32( sourceFile->GetName().Get(), sourceFile->GetName().GetLength() );
+    const uint32_t sourceNameHash = xxHash::Calc32( sourceFile->GetName().Get(), sourceFile->GetName().GetLength() );
 
     FileStream tmpFile;
     AStackString<> fileName( sourceFile->GetName().FindLast( NATIVE_SLASH ) + 1 );
@@ -2225,6 +2320,27 @@ bool ObjectNode::CompileHelper::SpawnCompiler( Job * job,
     // Handle special types of failures
     HandleSystemFailures( job, m_Result, m_Out, m_Err );
 
+    #if defined( ENABLE_FAKE_SYSTEM_FAILURE )
+        // Fake system failure for tests
+        if ( ( job->IsLocal() == false ) && ( sFakeSystemFailureState.Load() > DISABLED ) )
+        {
+            // Wait until racing
+            while ( sFakeSystemFailureState.Load() != RACING )
+            {
+                Thread::Sleep( 1 );
+            }
+            
+            // Add fake failure
+            ASSERT( m_Result == 0 ); // Should not have real failures if we're faking them
+            m_Result = 1;
+            job->Error( "Injecting system failure (sFakeSystemFailure)\n" );
+            job->OnSystemError();
+            
+            // Clear failure state
+            sFakeSystemFailureState.Store( DISABLED );
+        }
+    #endif
+
     if ( m_HandleOutput )
     {
         if ( job->IsLocal() && FBuild::Get().GetOptions().m_ShowCommandOutput )
@@ -2300,7 +2416,7 @@ bool ObjectNode::CompileHelper::SpawnCompiler( Job * job,
         // be 1. There seems to be no definitive way to differentiate this from
         // a process exiting with return code 1, so we default to considering it a
         // system failure, unless we can detect some specific situations.
-        if ( result == 0x1 )
+        if ( result == 0x1 ) // ERROR_INVALID_FUNCTION
         {
             bool treatAsSystemError = true;
 
@@ -2317,6 +2433,13 @@ bool ObjectNode::CompileHelper::SpawnCompiler( Job * job,
                 job->OnSystemError(); // task will be retried on another worker
                 return;
             }
+        }
+
+        // This error was observed remotely without a clear cause
+        if ( result == 0x4 ) // ERROR_TOO_MANY_OPEN_FILES
+        {
+            job->OnSystemError(); // task will be retried on another worker
+            return;
         }
 
         // If DLLs are not correctly sync'd, add an extra message to help the user
@@ -2349,10 +2472,12 @@ bool ObjectNode::CompileHelper::SpawnCompiler( Job * job,
                 return;
             }
 
-            // Windows temp directories can have problems failing to open temp files
-            // resulting in 'C1083: Cannot open compiler intermediate file:'
-            // It uses the same C1083 error as a mising include C1083, but since we flatten
-            // includes on the host this should never occur remotely other than in this context.
+            // If the compiler can fail with C1083 on the remote host for at least the following
+            // reasons:
+            //     a) Failed to create a temp file (C1083: Cannot open compiler intermediate file)
+            //          - This was seen when the tmp dir was full (tmp file creation failed)
+            //     b) Failed to write an extra output file (C1083: Cannot open compiler generated file)
+            //          - This was seen when using /sourceDependencies and the output folder didn't exist
             if ( stdOut.Find( "C1083" ) )
             {
                 job->OnSystemError();
